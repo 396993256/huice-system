@@ -5,13 +5,19 @@ import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import akshare as ak
+try:
+    import akshare as ak
+except ImportError:
+    ak = None
 
 from data.models import get_conn, init_db
 
 
 def fetch_stocks():
     """拉取沪深京 A 股列表。"""
+    if ak is None:
+        raise ImportError("请先安装 akshare: pip install akshare")
+
     print("正在获取 A 股列表...")
     df = ak.stock_info_a_code_name()
     df.columns = ["code", "name"]

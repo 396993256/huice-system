@@ -7,7 +7,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import time
 
-import akshare as ak
+try:
+    import akshare as ak
+except ImportError:
+    ak = None
 import pandas as pd
 from loguru import logger
 
@@ -20,6 +23,9 @@ def fetch_daily(symbols, start_date="20200101", end_date="20251231", sleep=0.5):
     symbols: 股票代码列表，如 ["000001", "600519"]
     start_date / end_date: "YYYYMMDD"
     """
+    if ak is None:
+        raise ImportError("请先安装 akshare: pip install akshare")
+
     conn = get_conn()
     cursor = conn.cursor()
 

@@ -997,6 +997,533 @@ def review_screener(date=None, top=30):
 
 
 # ═══════════════════════════════════════════
+# 市场宽度指标
+# ═══════════════════════════════════════════
+
+def market_breadth(start_date="20250101", end_date="20991231"):
+    """市场宽度分析 — 涨跌比、新高新低、赚钱效应趋势。
+
+    返回 dict:
+        daily       — DataFrame，每日涨跌比/情绪/新高新低
+        summary     — dict，汇总统计
+        trend       — str，当前趋势（扩张/收敛/极端）
+        signal      — str，交易信号
+    """
+    c = _conn()
+    rows = c.execute("""
+        SELECT trade_date, data_json FROM review_indicators
+        WHERE trade_date >= ? AND trade_date <= ?
+        ORDER BY trade_date
+    """, (start_date, end_date)).fetchall()
+    c.close()
+
+    if not rows:
+        return {"daily": pd.DataFrame(), "summary": {}, "trend": "无数据", "signal": "无数据"}
+
+    records = []
+    for r in rows:
+        ind = json.loads(r["data_json"])
+        up = ind.get("SZ", 0)
+        down = ind.get("XD", 0)
+        zt = ind.get("ZT", 0)
+        dt = ind.get("DT", 0)
+        total = up + down
+        records.append({
+            "trade_date": r["trade_date"],
+            "up_count": up,
+            "down_count": down,
+            "total": total,
+            "up_ratio": round(up / total * 100, 1) if total > 0 else 50,
+            "zt_count": zt,
+            "dt_count": dt,
+            "zt_dt_ratio": round(zt / max(dt, 1), 1),
+            "emotion": ind.get("QX", 50),
+            "market_cap_flow": ind.get("HSLN", 0),
+        })
+
+    df = pd.DataFrame(records)
+    df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d")
+
+    # 计算滚动指标
+    df["up_ratio_ma5"] = df["up_ratio"].rolling(5, min_periods=1).mean()
+    df["breadth_z"] = (df["up_ratio"] - df["up_ratio"].mean()) / df["up_ratio"].std()
+
+    # 宽度状态分类
+    latest = df.iloc[-1]
+    breadth_z = latest["breadth_z"]
+
+    if breadth_z >= 1.5:
+        trend = "极端乐观 — 涨跌比远超均值，注意过热"
+    elif breadth_z >= 0.5:
+        trend = "扩张 — 赚钱效应扩散，可积极参与"
+    elif breadth_z >= -0.5:
+        trend = "中性 — 涨跌均衡，结构性行情"
+    elif breadth_z >= -1.5:
+        trend = "收敛 — 赚钱效应收窄，控制仓位"
+    else:
+        trend = "极端悲观 — 普跌格局，防御为主"
+
+    # 交易信号
+    if breadth_z >= 1.5 and latest["zt_count"] >= 100:
+        signal = "⚠ 情绪过热 + 宽度极值 → 注意高位风险"
+    elif breadth_z >= 0.5 and latest["up_ratio"] > 55:
+        signal = "✅ 宽度扩张 + 赚钱效应好 → 积极做多"
+    elif breadth_z <= -1.0:
+        signal = "🛑 宽度极值冰点 → 等待企稳信号"
+    elif breadth_z <= -0.5:
+        signal = "⚠ 宽度收敛 → 控制仓位，精选个股"
+    elif df["breadth_z"].iloc[-2] < -0.5 and breadth_z > -0.3:
+        signal = "🔥 冰点修复信号 → 关注情绪拐点"
+    else:
+        signal = "➡ 中性 — 跟随主线，正常操作"
+
+    # 汇总
+    summary = {
+        "latest_up_ratio": float(latest["up_ratio"]),
+        "latest_zt": int(latest["zt_count"]),
+        "latest_dt": int(latest["dt_count"]),
+        "breadth_z": round(float(breadth_z), 2),
+        "up_ratio_ma5": round(float(latest["up_ratio_ma5"]), 1),
+        "market_flow": float(latest["market_cap_flow"]),
+    }
+
+    return {"daily": df, "summary": summary, "trend": trend, "signal": signal}
+
+
+def market_breadth_report():
+    """生成市场宽度文字报告。"""
+    mb = market_breadth()
+    if mb["daily"].empty:
+        return "暂无数据"
+
+    df = mb["daily"]
+    s = mb["summary"]
+
+    lines = [
+        "=" * 56,
+        "  市场宽度分析",
+        "=" * 56,
+        f"\n当前涨跌比: {s['latest_up_ratio']}%",
+        f"涨跌比5日均值: {s['up_ratio_ma5']}%",
+        f"宽度Z-score: {s['breadth_z']}",
+        f"涨停/跌停比: {s['latest_zt']}/{s['latest_dt']}",
+        f"主力资金: {s['market_flow']}亿",
+        f"\n状态: {mb['trend']}",
+        f"信号: {mb['signal']}",
+        "",
+        "近10日涨跌比变化:",
+    ]
+
+    for _, row in df.tail(10).iterrows():
+        bar = "█" * int(row["up_ratio"] / 5)
+        lines.append(f"  {row['trade_date'].strftime('%m-%d')} {row['up_ratio']:5.1f}% {bar}")
+
+    lines.append("=" * 56)
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════
+# 资金流向趋势分析
+# ═══════════════════════════════════════════
+
+def capital_flow_trend(start_date="20250101", end_date="20991231"):
+    """板块资金流向趋势分析 — 识别资金持续流入/流出的板块。
+
+    返回 DataFrame，列:
+        concept      — 板块名称
+        total_flow   — 累计资金净流入（全周期）
+        recent_flow  — 近5日资金净流入
+        flow_days    — 净流入天数
+        out_days     — 净流出天数
+        net_ratio    — 净流入天数占比
+        trend        — 持续流入/流入偏多/均衡/流出偏多/持续流出
+        avg_stocks   — 平均涨停数
+    """
+    c = _conn()
+
+    # 获取概念分组数据（含涨停数，用于估算资金热度）
+    rows = c.execute("""
+        SELECT concept, trade_date, stock_count
+        FROM review_concept_groups
+        WHERE trade_date >= ? AND trade_date <= ?
+        ORDER BY trade_date
+    """, (start_date, end_date)).fetchall()
+    c.close()
+
+    if not rows:
+        return pd.DataFrame()
+
+    # 组织结构
+    concept_data = defaultdict(lambda: {"dates": [], "stock_counts": []})
+    all_dates = sorted(set(r["trade_date"] for r in rows))
+
+    for r in rows:
+        concept_data[r["concept"]]["dates"].append(r["trade_date"])
+        concept_data[r["concept"]]["stock_counts"].append(r["stock_count"])
+
+    # 计算资金热度 = 涨停数 × 强度替代（无法直接获取资金流时用涨停数作为代理变量）
+    results = []
+    for concept, data in concept_data.items():
+        dates = data["dates"]
+        counts = data["stock_counts"]
+        if len(dates) < 3:
+            continue
+
+        # 计算日均涨停变化作为"资金流"代理
+        df_temp = pd.DataFrame({"date": pd.to_datetime(dates, format="%Y%m%d"), "count": counts})
+        df_temp = df_temp.sort_values("date")
+        df_temp["count_ma3"] = df_temp["count"].rolling(3, min_periods=1).mean()
+        df_temp["flow_change"] = df_temp["count"].diff()
+
+        # 流入/流出判断（涨停数增加=资金流入，减少=流出）
+        flow_days = int((df_temp["flow_change"] > 0).sum())
+        out_days = int((df_temp["flow_change"] < 0).sum())
+        total_days = len(df_temp)
+
+        # 近5日
+        recent = df_temp.tail(5)
+        recent_flow = int(recent["flow_change"].sum())
+
+        net_ratio = flow_days / max(total_days, 1) * 100
+
+        if net_ratio >= 65:
+            trend = "持续流入"
+        elif net_ratio >= 55:
+            trend = "流入偏多"
+        elif net_ratio >= 45:
+            trend = "均衡"
+        elif net_ratio >= 35:
+            trend = "流出偏多"
+        else:
+            trend = "持续流出"
+
+        results.append({
+            "concept": concept,
+            "total_days": total_days,
+            "total_flow_proxy": int(sum(counts)),
+            "recent_flow": recent_flow,
+            "flow_days": flow_days,
+            "out_days": out_days,
+            "net_ratio": round(net_ratio, 1),
+            "trend": trend,
+            "avg_stocks": round(sum(counts) / total_days, 1) if total_days > 0 else 0,
+            "last_count": counts[-1] if counts else 0,
+        })
+
+    df = pd.DataFrame(results)
+    if df.empty:
+        return df
+    return df.sort_values("net_ratio", ascending=False).reset_index(drop=True)
+
+
+def capital_flow_report():
+    """生成资金流向文字报告。"""
+    cf = capital_flow_trend()
+    if cf.empty:
+        return "暂无数据"
+
+    lines = [
+        "=" * 64,
+        "  资金流向趋势分析（基于涨停数变化代理）",
+        "=" * 64,
+        f"\n{'板块':<14s} {'天数':>5s} {'均涨停':>7s} {'流入天':>6s} {'流出天':>6s} {'占比':>7s} {'趋势':<10s}",
+        "-" * 64,
+    ]
+
+    for _, row in cf.head(20).iterrows():
+        lines.append(
+            f"{row['concept']:<14s} {int(row['total_days']):5d} "
+            f"{row['avg_stocks']:7.1f} {int(row['flow_days']):6d} "
+            f"{int(row['out_days']):6d} {row['net_ratio']:6.1f}% {row['trend']:<10s}"
+        )
+
+    # 流入/流出TOP
+    lines.append(f"\n持续流入板块 TOP5:")
+    inflow = cf[cf["trend"].isin(["持续流入", "流入偏多"])].head(5)
+    for _, row in inflow.iterrows():
+        lines.append(f"  {row['concept']} — {row['net_ratio']:.0f}%流入, 日均{row['avg_stocks']}只涨停")
+
+    lines.append(f"\n持续流出板块 TOP5:")
+    outflow = cf[cf["trend"].isin(["持续流出", "流出偏多"])].head(5)
+    for _, row in outflow.iterrows():
+        lines.append(f"  {row['concept']} — {(100-row['net_ratio']):.0f}%流出, 日均{row['avg_stocks']}只涨停")
+
+    lines.append("=" * 64)
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════
+# 概念轮动速度
+# ═══════════════════════════════════════════
+
+def concept_rotation_speed(start_date="20250101", end_date="20991231", window=5):
+    """概念轮动速度分析 — 衡量市场风格切换频率。
+
+    轮动速度快 = 每日热点概念更换频繁 = 适合短线快进快出
+    轮动速度慢 = 主线持续 = 适合持股待涨
+
+    返回 dict:
+        daily       — DataFrame，每日轮动速度
+        current     — float，当前轮动速度
+        avg         — float，平均轮动速度
+        trend       — str，加速/稳定/减速
+        signal      — str，策略建议
+    """
+    c = _conn()
+    rows = c.execute("""
+        SELECT trade_date, concept FROM review_concept_groups
+        WHERE trade_date >= ? AND trade_date <= ?
+        ORDER BY trade_date
+    """, (start_date, end_date)).fetchall()
+    c.close()
+
+    if not rows:
+        return {"daily": pd.DataFrame(), "current": 0, "avg": 0, "trend": "无数据", "signal": "无数据"}
+
+    # 按日期分组
+    date_concepts = defaultdict(set)
+    for r in rows:
+        date_concepts[r["trade_date"]].add(r["concept"])
+
+    sorted_dates = sorted(date_concepts.keys())
+
+    # 计算每日轮动速度 = 与前一日的概念重叠度（越低轮动越快）
+    records = []
+    for i, date in enumerate(sorted_dates):
+        curr_set = date_concepts[date]
+        if i == 0:
+            overlap_pct = 100
+            new_concepts = len(curr_set)
+            gone_concepts = 0
+        else:
+            prev_set = date_concepts[sorted_dates[i - 1]]
+            common = curr_set & prev_set
+            overlap_pct = round(len(common) / max(len(prev_set), 1) * 100, 1)
+            new_concepts = len(curr_set - prev_set)
+            gone_concepts = len(prev_set - curr_set)
+
+        rotation_speed = 100 - overlap_pct  # 0=完全持续, 100=完全轮动
+        records.append({
+            "trade_date": date,
+            "concept_count": len(curr_set),
+            "overlap_pct": overlap_pct,
+            "rotation_speed": rotation_speed,
+            "new_concepts": new_concepts,
+            "gone_concepts": gone_concepts,
+        })
+
+    df = pd.DataFrame(records)
+    df["trade_date"] = pd.to_datetime(df["trade_date"], format="%Y%m%d")
+    df["speed_ma5"] = df["rotation_speed"].rolling(window, min_periods=1).mean()
+
+    current_speed = float(df["speed_ma5"].iloc[-1])
+    avg_speed = float(df["rotation_speed"].mean())
+
+    # 趋势判断
+    if len(df) >= 5:
+        recent_avg = df["speed_ma5"].tail(3).mean()
+        older_avg = df["speed_ma5"].iloc[-6:-3].mean() if len(df) >= 6 else recent_avg
+        if recent_avg > older_avg * 1.2:
+            speed_trend = "加速轮动"
+        elif recent_avg < older_avg * 0.8:
+            speed_trend = "减速（主线凝聚）"
+        else:
+            speed_trend = "稳定"
+    else:
+        speed_trend = "数据不足"
+
+    # 策略信号
+    if current_speed > 70:
+        signal = "⚡ 高速轮动 — 热点一日游，快进快出，不恋战"
+    elif current_speed > 50:
+        signal = "🔄 中速轮动 — 2-3日热点，短线操作"
+    elif current_speed > 30:
+        signal = "📈 低速轮动 — 主线持续，可持股待涨"
+    else:
+        signal = "🔒 主线锁定 — 板块持续性极强，重仓主线"
+
+    return {
+        "daily": df,
+        "current": round(current_speed, 1),
+        "avg": round(avg_speed, 1),
+        "trend": speed_trend,
+        "signal": signal,
+    }
+
+
+def rotation_report():
+    """生成概念轮动速度文字报告。"""
+    rs = concept_rotation_speed()
+    if rs["daily"].empty:
+        return "暂无数据"
+
+    lines = [
+        "=" * 56,
+        "  概念轮动速度分析",
+        "=" * 56,
+        f"\n当前轮动速度: {rs['current']}%  (历史均值: {rs['avg']}%)",
+        f"趋势: {rs['trend']}",
+        f"信号: {rs['signal']}",
+        f"\n近10日轮动变化:",
+    ]
+
+    for _, row in rs["daily"].tail(10).iterrows():
+        bar = "█" * int(row["rotation_speed"] / 5)
+        label = "高速" if row["rotation_speed"] > 60 else ("中速" if row["rotation_speed"] > 40 else "低速")
+        lines.append(
+            f"  {row['trade_date'].strftime('%m-%d')} "
+            f"速度{row['rotation_speed']:5.1f}% {label:<4s} {bar}"
+        )
+
+    lines.append("=" * 56)
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════
+# 封板质量分析
+# ═══════════════════════════════════════════
+
+def seal_quality_analysis(start_date="20250101", end_date="20991231"):
+    """封板质量统计分析 — 各板型的出现频率和次日表现。
+
+    返回 dict:
+        matrix      — DataFrame，各板型的统计
+        by_date     — DataFrame，每日封板质量分布
+        summary     — dict，当前汇总
+    """
+    c = _conn()
+    rows = c.execute("""
+        SELECT trade_date, code, name, lianban, ban_type, seal_amount
+        FROM review_zt_stocks
+        WHERE trade_date >= ? AND trade_date <= ?
+        ORDER BY trade_date
+    """, (start_date, end_date)).fetchall()
+    c.close()
+
+    if not rows:
+        return {"matrix": pd.DataFrame(), "by_date": pd.DataFrame(), "summary": {}}
+
+    # 分类封板类型
+    def classify_seal(ban_type):
+        bt = ban_type or ""
+        if "一字" in bt:
+            return "一字板"
+        elif "T字" in bt:
+            return "T字板"
+        elif "回封" in bt:
+            return "回封板"
+        elif "分歧" in bt:
+            return "分歧板"
+        elif "弱" in bt:
+            return "弱板"
+        elif "强" in bt:
+            return "强板"
+        else:
+            return "普通板"
+
+    # 统计各板型
+    seal_stats = defaultdict(lambda: {"count": 0, "codes": []})
+    daily_seal = defaultdict(lambda: defaultdict(int))
+
+    for r in rows:
+        seal_type = classify_seal(r["ban_type"])
+        seal_stats[seal_type]["count"] += 1
+        seal_stats[seal_type]["codes"].append(r["code"])
+        daily_seal[r["trade_date"]][seal_type] += 1
+
+    # 矩阵
+    total = sum(s["count"] for s in seal_stats.values())
+    matrix_rows = []
+    for seal_type, stats in sorted(seal_stats.items(), key=lambda x: x[1]["count"], reverse=True):
+        matrix_rows.append({
+            "封板类型": seal_type,
+            "数量": stats["count"],
+            "占比": round(stats["count"] / total * 100, 1) if total > 0 else 0,
+        })
+
+    matrix = pd.DataFrame(matrix_rows)
+
+    # 每日分布
+    sorted_dates = sorted(daily_seal.keys())
+    daily_rows = []
+    for d in sorted_dates:
+        row = {"trade_date": d}
+        row.update(dict(daily_seal[d]))
+        daily_rows.append(row)
+
+    by_date = pd.DataFrame(daily_rows) if daily_rows else pd.DataFrame()
+
+    # 汇总
+    latest_date = sorted_dates[-1] if sorted_dates else ""
+    latest_seals = daily_seal.get(latest_date, {})
+    quality_score = (
+        latest_seals.get("一字板", 0) * 100
+        + latest_seals.get("T字板", 0) * 80
+        + latest_seals.get("强板", 0) * 60
+        + latest_seals.get("回封板", 0) * 50
+        + latest_seals.get("普通板", 0) * 40
+        - latest_seals.get("分歧板", 0) * 20
+        - latest_seals.get("弱板", 0) * 40
+    )
+    total_seals = sum(latest_seals.values())
+    avg_quality = round(quality_score / max(total_seals, 1), 1)
+
+    return {
+        "matrix": matrix,
+        "by_date": by_date,
+        "summary": {
+            "latest_date": latest_date,
+            "total_zt": total_seals,
+            "quality_score": avg_quality,
+            "seal_distribution": latest_seals,
+        },
+    }
+
+
+def seal_quality_report():
+    """生成封板质量文字报告。"""
+    sq = seal_quality_analysis()
+    if sq["matrix"].empty:
+        return "暂无数据"
+
+    s = sq["summary"]
+
+    lines = [
+        "=" * 56,
+        "  封板质量分析",
+        "=" * 56,
+        f"\n最近交易日: {s['latest_date']}",
+        f"涨停总数: {s['total_zt']}",
+        f"封板质量评分: {s['quality_score']} (越高越好)",
+        f"\n封板类型分布:",
+    ]
+
+    for seal_type, count in sorted(s["seal_distribution"].items(), key=lambda x: x[1], reverse=True):
+        pct = round(count / s["total_zt"] * 100, 1) if s["total_zt"] > 0 else 0
+        bar = "█" * (count // max(1, s["total_zt"] // 20))
+        lines.append(f"  {seal_type:<8s} {count:4d} ({pct:5.1f}%) {bar}")
+
+    lines.append(f"\n全周期统计 ({len(sq['by_date'])}天):")
+    lines.append(f"{'封板类型':<10s} {'数量':>6s} {'占比':>7s}")
+    lines.append("-" * 28)
+    for _, row in sq["matrix"].iterrows():
+        lines.append(f"{row['封板类型']:<10s} {int(row['数量']):6d} {row['占比']:6.1f}%")
+
+    # 质量解读
+    if s["quality_score"] >= 70:
+        lines.append(f"\n解读: 封板质量优秀，一字/强板占主导，市场做多意愿强")
+    elif s["quality_score"] >= 50:
+        lines.append(f"\n解读: 封板质量良好，主流板块封板稳固")
+    elif s["quality_score"] >= 30:
+        lines.append(f"\n解读: 封板质量一般，分歧较大，注意风险")
+    else:
+        lines.append(f"\n解读: 封板质量差，弱板/分歧板居多，慎追涨停")
+
+    lines.append("=" * 56)
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════
 
@@ -1008,6 +1535,10 @@ if __name__ == "__main__":
     p.add_argument("--lianban", action="store_true", help="连板胜率矩阵")
     p.add_argument("--mainline", action="store_true", help="主线识别器")
     p.add_argument("--screener", action="store_true", help="复盘驱动选股")
+    p.add_argument("--breadth", action="store_true", help="市场宽度分析")
+    p.add_argument("--flow", action="store_true", help="资金流向趋势分析")
+    p.add_argument("--rotation", action="store_true", help="概念轮动速度分析")
+    p.add_argument("--seal", action="store_true", help="封板质量分析")
     p.add_argument("--concept", type=str, default="", help="查询指定概念的时间线")
     p.add_argument("--top", type=int, default=20, help="显示前 N 条")
     p.add_argument("--active", action="store_true", help="仅显示近20日活跃")
@@ -1055,6 +1586,51 @@ if __name__ == "__main__":
                 print(f"{row['grade']:<6s} {row['code']:<8s} {row['name']:<10s} "
                       f"{int(row['lianban'])}板{'':<3s} {row['ban_type']:<8s} "
                       f"{row['concept']:<14s} {row['score']:5.1f}")
+
+    elif args.breadth:
+        mb = market_breadth()
+        if args.json:
+            out = mb["daily"].copy()
+            out["trade_date"] = out["trade_date"].astype(str)
+            print(json.dumps({
+                "summary": mb["summary"],
+                "trend": mb["trend"],
+                "signal": mb["signal"],
+                "daily": out.to_dict(orient="records"),
+            }, ensure_ascii=False, indent=2, default=str))
+        else:
+            print(market_breadth_report())
+
+    elif args.flow:
+        cf = capital_flow_trend()
+        if args.json:
+            print(cf.head(args.top).to_json(orient="records", force_ascii=False, indent=2))
+        else:
+            print(capital_flow_report())
+
+    elif args.rotation:
+        rs = concept_rotation_speed()
+        if args.json:
+            out = rs["daily"].copy()
+            out["trade_date"] = out["trade_date"].astype(str)
+            print(json.dumps({
+                "current": rs["current"],
+                "avg": rs["avg"],
+                "trend": rs["trend"],
+                "signal": rs["signal"],
+            }, ensure_ascii=False, indent=2))
+        else:
+            print(rotation_report())
+
+    elif args.seal:
+        sq = seal_quality_analysis()
+        if args.json:
+            print(json.dumps({
+                "matrix": sq["matrix"].to_dict(orient="records"),
+                "summary": sq["summary"],
+            }, ensure_ascii=False, indent=2, default=str))
+        else:
+            print(seal_quality_report())
 
     elif args.concept:
         tl = concept_timeline(args.concept)

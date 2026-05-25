@@ -134,6 +134,48 @@ def load_market_data(use_api=True):
     return result
 
 
+def _inject_analytics_context():
+    """注入分析引擎结论到 AI 上下文（情绪周期 + 主线识别）。"""
+    lines = []
+    try:
+        from review.analytics import sentiment_cycle, mainline_identifier
+        sc = sentiment_cycle()
+        if not sc.empty:
+            latest = sc.iloc[-1]
+            lines.append("## 0. 情绪周期分析")
+            lines.append(f"当前阶段: {latest['phase']} (composite={latest['composite']:.2f})")
+            lines.append(f"涨停: {int(latest['ZT'])} | 跌停: {int(latest['DT'])} | 封板率: {latest['FB']:.1f}%")
+            lines.append(f"1进2晋级: {latest.get('jinji_1_2', 'N/A')}% | 连板高度: {int(latest['LBGD'])}")
+
+            # 近3天拐点
+            inflections = sc[sc["inflection"]].tail(3)
+            if not inflections.empty:
+                pts = []
+                for _, row in inflections.iterrows():
+                    arrow = "↑" if row["inflection_type"] == "底" else "↓"
+                    pts.append(f"{row['trade_date'].strftime('%m-%d')} {arrow}{row['phase']}")
+                lines.append(f"近期拐点: {', '.join(pts)}")
+            lines.append("")
+
+        ml = mainline_identifier()
+        if not ml.empty:
+            mains = ml[ml["label"] == "主线"]
+            hots = ml[ml["label"].isin(["主线", "热点支线"])]
+            if not mains.empty:
+                lines.append("## 0.5 主线识别（基于近10日数据）")
+                for _, row in mains.iterrows():
+                    lines.append(f"  {row['concept']} — {row['trend']}趋势, 日均{row['avg_zt']}只涨停, 置信度{row['confidence']}")
+            elif not hots.empty:
+                lines.append("## 0.5 热点识别")
+                for _, row in hots.head(3).iterrows():
+                    lines.append(f"  {row['concept']} — {row['trend']}, 日均{row['avg_zt']}只涨停")
+            lines.append("")
+    except Exception as e:
+        lines.append(f"[分析引擎调用失败: {e}]")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def load_review_context(date=None):
     """加载最近交易日的复盘数据作为 AI 分析上下文。
     返回格式化文本，失败返回 None。
@@ -366,42 +408,90 @@ def format_data_table(market_data):
 # Part 2: AI 分析引擎
 # ============================================================
 
-SYSTEM_PROMPT = """你是一个A股短线打板交易专家。你会收到当日完整的市场数据，包括：
+SYSTEM_PROMPT = """你是一个A股短线打板交易专家，专注于竞价→开盘30分钟内的短线决策。你会收到当日完整的市场数据。
 
-- 前一日复盘数据（市场指标/板块强度/概念分组与启动理由/连板梯队/龙虎榜）
-- 市场情绪（涨停数/跌停数/上涨数/下跌数/主力资金流/封板率）
-- 板块强度排行（主力资金进攻方向）
-- 竞价数据（涨停委买/竞价爆量/竞价净额）
-- 股票池（连板池/涨停池/分析池）
-- 竞价异动（封涨大减/涨停回封/涨停打开等实时异动）
-- 热点题材
+═══════════════════════════════════════════
+【分析框架】四层递进：宏观情绪 → 板块方向 → 个股精选 → 风控执行
+═══════════════════════════════════════════
 
-请完成以下分析并输出交易指令：
+【数据解读指南】
+- 前一日复盘：情绪周期位置（冰点/退潮/修复/高潮）决定仓位；概念分组+启动理由判断主线逻辑
+- 板块强度：270板块实时强度排行，强度>3000为强，>5000为极强，关注强度突升板块
+- 涨停委买(Daban)：封单金额越大越强，>5亿为强力封板，1-3亿为中等，<5000万警惕开板
+- 竞价爆量(Vratio)：量比>5为显著爆量，>10为极端爆量，说明资金竞价抢筹
+- 竞价净额(Zhuli)：正值代表主力竞价净买入，>3000万为主动进攻
+- 竞价抢筹(Qiangchou)：抢筹比例越高，开盘拉升概率越大
+- 连板池(Lb)：2-4板性价比最高（既有辨识度又有空间），5板以上追高风险递增
+- 竞价异动：封涨大减=风险信号；涨停回封=弱转强信号；涨停打开后回封封单>之前=超级强势
 
-### 1. 主线判断
-对比昨日复盘数据与今日板块强度/热点题材，判断主线是延续还是切换，找出今日最强主线题材（1-2个）。
+【选股评分体系】（满分100分）
+总评分 = 题材(25) + 竞价(30) + 技术面(20) + 辨识度(15) + 安全性(10)
 
-### 2. 连板晋级预判
-结合昨日连板梯队和今日竞价数据，预判哪些连板股有望晋级（关注：竞价量比、封单变化、板块持续性）。
+1. 题材得分（25分）：
+   - 主线核心股：25分 | 主线跟风：18分 | 支线龙头：12分 | 非主线：5分
+2. 竞价得分（30分）：
+   - 封单>5亿：15分 | 2-5亿：10分 | 0.5-2亿：5分 | <0.5亿：0分
+   - 量比>5：10分 | 2-5：6分 | <2：2分
+   - 竞价净流入>3000万：5分 | >0：3分 | 流出：0分
+3. 技术面得分（20分）：
+   - 首板/二板：15分 | 三板：18分 | 四板：20分 | 五板：10分 | 六板+：5分
+   - 一字板+5分 | T字板+3分 | 换手板+0分 | 分歧板-5分
+4. 辨识度得分（15分）：
+   - 板块日内龙头（最先封板）：15分 | 板块人气股：10分 | 普通跟风：5分
+5. 安全性得分（10分）：
+   - 流通市值50-200亿：10分 | 20-50亿：7分 | >200亿：5分 | <20亿：3分
+   - 非ST/*ST/问题股，否则总分直接归0
 
-### 3. 龙头推荐
-综合竞价数据+连板池+竞价异动+昨日复盘，选出 TOP 5 最值得打的板。
-标准：封单金额大 > 竞价量比高 > 连板数合理（2-4板最优） > 题材是主线。
+【决策规则】
+- 总分≥80：强力买入，可用3成仓位
+- 总分65-79：可以考虑，单票不超过2成仓位
+- 总分50-64：观望为主，仅迷你仓试探
+- 总分<50：放弃
 
-### 4. 交易指令
-输出格式（每行一条，严格遵守）：
+【风控铁律】
+- 情绪处于"冰点"或"退潮"阶段 → 仓位≤3成
+- 情绪处于"高潮"阶段且连板高度>7 → 注意高位风险，仓位≤5成
+- 跌停数>20只 → 强制空仓或≤1成
+- 封板率<60% → 市场脆弱，减半仓
+- 单日总买入不超过3只股票
+- 同一板块最多买2只
+- 有利润的票次日不涨停必须卖
+
+═══════════════════════════════════════════
+【输出格式】（严格遵守）
+
+## 情绪周期定位
+当前阶段: [冰点/退潮/修复/修复偏暖/高潮]
+周期建议: [一句话]
+
+## 主线判断
+最强主线: [1-2个题材]
+主线逻辑: [延续/切换/新起] — [一句话说明]
+资金方向: [竞价资金流向哪个板块]
+
+## 连板晋级预判
+| 股票 | 当前连板 | 晋级概率 | 关键信号 |
+|------|---------|---------|---------|
+| XX | X板 | 高/中/低 | 竞价量比X、封单X、板块X |
+
+## TOP 5 精选
+按评分体系排序（需给出具体分数）：
+| 排名 | 代码 | 名称 | 题材(25) | 竞价(30) | 技术(20) | 辨识(15) | 安全(10) | 总分 | 操作建议 |
+|------|------|------|---------|---------|---------|---------|---------|------|---------|
+
+## 交易指令
 买入: 代码 数量股 价格 理由
 卖出: 代码 数量股 价格 理由
+（代码纯数字、数量100的整数倍、价格填"市价"或具体数字）
+（如建议空仓：买入: 无 0 空仓 [原因]）
 
-- 代码用纯数字（如 000725 不是 000725.SZ）
-- 数量必须是100的整数倍（A股1手=100股）
-- 价格填"市价"或具体数字
-- 如果建议空仓，输出：买入: 无 0 空仓 市场风险过高
+## 风控评估
+市场情绪: [乐观/中性/谨慎/危险]
+建议仓位: [全仓/7成/5成/3成/1成/空仓]
+核心风险: [1-2个最需关注的风险点]
+止损建议: [关键止损位或条件]"""
 
-### 5. 风控评估
-市场情绪: [乐观/中性/谨慎]
-建议仓位: [全仓/7成/5成/3成/空仓]
-风险提示: [一句话]"""
+
 
 
 def call_deepseek(data_text):
@@ -424,7 +514,7 @@ def call_deepseek(data_text):
             {"role": "user", "content": data_text},
         ],
         temperature=0.3,
-        max_tokens=2000,
+        max_tokens=3000,
     )
     return resp.choices[0].message.content
 
@@ -444,7 +534,7 @@ def call_claude(data_text):
     print("[AI] 调用 Claude 分析中...")
     resp = client.messages.create(
         model="claude-opus-4-7",
-        max_tokens=2000,
+        max_tokens=3000,
         temperature=0.3,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": data_text}],
@@ -695,6 +785,12 @@ def main():
 
     # ---- Step 1.5: 复盘上下文 ----
     if args.review and not args.no_review:
+        print("  [数据] 注入分析引擎结论...")
+        analytics_text = _inject_analytics_context()
+        if analytics_text:
+            data_text = analytics_text + data_text
+            print(f"   [OK] 情绪周期+主线识别已注入")
+
         review_text = load_review_context()
         if review_text:
             data_text = review_text + "\n---\n\n" + data_text

@@ -1,0 +1,41 @@
+# 密钥和配置
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 数据文件（含敏感信息或过大）
+*.db
+*.json
+!.env.example
+!requirements.txt
+
+# Claude 本地配置
+.claude/settings.json
+.claude/settings.local.json
+
+# Session 缓存
+.dx_session.json
+.scheduled_tasks.json
+
+# 临时文件
+result.txt
+search_dir.py
+search_dir2.py
+
+# OS
+Thumbs.db
+.DS_Store

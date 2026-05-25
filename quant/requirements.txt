@@ -1,8 +1,9 @@
+streamlit>=1.28
 pandas>=2.0
 numpy>=1.24
+matplotlib>=3.7
 akshare>=1.12
-pandas-ta>=0.3
+pandas_ta>=0.3
 python-dotenv>=1.0
 loguru>=0.7
-easytrader>=0.24
 schedule>=1.2
